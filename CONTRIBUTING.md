@@ -66,7 +66,9 @@ Small fixes, typos, and obviously-correct bug fixes can go straight to a PR.
   discussion to have in an issue, not a surprise in a PR.
 - **New runtime dependencies.** No modules to install, no NuGet, no internet at
   scan time. An operator copies one `.ps1` to a jump box and runs it, sometimes
-  on an isolated network. Node and Playwright are dev-only, for the report test.
+  on an isolated network. This applies to the collector; the optional `api/`
+  server has its own .NET dependencies. Node and Playwright are dev-only, for
+  the report test.
 - **Anything that puts credential material on disk, in a log, on a command line,
   or in a report.**
 - **Silent failure.** If a collector cannot get data, say so. The single worst
@@ -128,6 +130,8 @@ push whose GUID differs from the first published version's is rejected outright.
   not @(.Keys).Count - workers are still inserting concurrently` is the kind of
   comment that stops the next person reintroducing a race.
 - Keep the single-file layout. It is deliberate: one file to copy to a jump box.
+  Keep the optional API isolated under `api/`; it must never become a prerequisite
+  for scanning. See [API development and deployment](api/README.md) for its checks.
 
 ## Reporting bugs
 

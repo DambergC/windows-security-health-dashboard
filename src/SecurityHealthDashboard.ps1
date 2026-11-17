@@ -152,6 +152,7 @@ Full history: https://github.com/JosephMcEvoy/windows-security-health-dashboard/
         3  at least one target could not be scanned (incomplete data outranks
            the finding severities, because a monitoring job that silently lost a
            host is worse than one that found problems)
+        4  at least one requested upload failed (scan failures still return 3)
 
 .PARAMETER OutputPath
     Directory for the generated .html, .json and summary .csv (created if
@@ -159,6 +160,14 @@ Full history: https://github.com/JosephMcEvoy/windows-security-health-dashboard/
 
 .PARAMETER NoHtml
     Write only the JSON snapshots, skipping the HTML reports.
+
+.PARAMETER ApiEndpoint
+    Opt-in HTTPS ingestion URL, including /api/v1/scans. Requires -Quiet.
+    Uses the process Windows identity, never the target -Credential.
+    Each host upload has at most three 30-second attempts and two delays of
+    at most 10 seconds (up to 110 seconds per host, separate from -TimeoutSec).
+    Local reports are retained on failure. Exit code 4 means upload failure;
+    scan failure (3) still takes precedence.
 
 .PARAMETER Credential
     A PSCredential to connect with, supplied at launch instead of being typed into
@@ -250,6 +259,8 @@ param(
     # Write only the JSON snapshots, skipping the HTML reports.
     [switch]$NoHtml,
 
+    [string]$ApiEndpoint = '',
+
     # Overall ceiling for a scan run. Targets still outstanding when it expires
     # are recorded as timed out. Without this a wedged WinRM call could keep a
     # scheduled task running indefinitely.
@@ -259,6 +270,18 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
+
+function Assert-UploadConfiguration {
+    param([string]$Endpoint, [bool]$Headless)
+    if (-not $Endpoint) { return }
+    if (-not $Headless) { throw '-ApiEndpoint requires -Quiet.' }
+    $uri = $null
+    if (-not [uri]::TryCreate($Endpoint, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne 'https' -or -not $uri.Host -or $uri.UserInfo -or $uri.Fragment -or $uri.Query) {
+        throw '-ApiEndpoint must be an absolute HTTPS URL without credentials, query, or fragment.'
+    }
+}
+Assert-UploadConfiguration -Endpoint $ApiEndpoint -Headless ([bool]$Quiet)
 
 # ---------------------------------------------------------------------------
 # WPF needs an STA thread. PS 3.0+ consoles default to STA, but guard anyway.
@@ -3161,12 +3184,12 @@ function ConvertTo-ScanSnapshot {
     [pscustomobject]$snap
 }
 
-function Save-ScanSnapshot {
-    param($d, [string]$Path)
+function New-ScanSnapshot {
+    param($d)
     $snap = ConvertTo-ScanSnapshot $d
     $meta = Get-Section $d 'Meta'
     $cc = Get-Section $d 'ClientContext'
-    $wrapper = [pscustomobject]@{
+    [pscustomobject]@{
         SchemaVersion = 1
         ToolVersion   = $script:ToolVersion
         Computer      = $(if ($meta) { [string]$meta.ComputerName } else { 'unknown' })
@@ -3175,7 +3198,11 @@ function Save-ScanSnapshot {
         CollectedBy   = $(if ($cc) { [string]$cc.RunBy } else { '' })
         Sections      = $snap
     }
-    $json = $wrapper | ConvertTo-Json -Depth 12
+}
+
+function Save-ScanSnapshot {
+    param($d, [string]$Path)
+    $json = New-ScanSnapshot $d | ConvertTo-Json -Depth 12
     [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
     $Path
 }
@@ -4747,11 +4774,137 @@ $script:Timer.Add_Tick({
 #  host with no desktop session. Everything here writes to the console and to
 #  disk; nothing depends on the dashboard.
 # ===========================================================================
+function Invoke-ScanUploadRequest {
+    param([string]$Endpoint, [byte[]]$Body)
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.UseDefaultCredentials = $true
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [timespan]::FromSeconds(30)
+    $content = [System.Net.Http.ByteArrayContent]::new($Body)
+    $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/json')
+    $content.Headers.ContentType.CharSet = 'utf-8'
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $Endpoint)
+    $request.Content = $content
+    $cancellation = [System.Threading.CancellationTokenSource]::new(30000)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $response = $null
+    try {
+        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $cancellation.Token).GetAwaiter().GetResult()
+        $text = ''
+        if ([int]$response.StatusCode -in @(200, 201)) {
+            $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $buffer = [byte[]]::new(4097)
+            $offset = 0
+            while ($offset -lt $buffer.Length) {
+                $remaining = 30000 - [int]$clock.ElapsedMilliseconds
+                if ($remaining -le 0) { throw [System.TimeoutException]::new('Upload acknowledgement timed out.') }
+                $read = $stream.ReadAsync($buffer, $offset, ($buffer.Length - $offset), $cancellation.Token)
+                if (-not $read.Wait($remaining)) { throw [System.TimeoutException]::new('Upload acknowledgement timed out.') }
+                $count = $read.GetAwaiter().GetResult()
+                if ($count -eq 0) { break }
+                $offset += $count
+            }
+            if ($offset -gt 4096) { throw 'Upload acknowledgement exceeds the response limit.' }
+            $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $offset)
+        }
+        $retryAfter = 0
+        if ($response.Headers.RetryAfter) {
+            if ($response.Headers.RetryAfter.Delta) {
+                $retryAfter = $response.Headers.RetryAfter.Delta.TotalSeconds
+            }
+            elseif ($response.Headers.RetryAfter.Date) {
+                $retryAfter = ($response.Headers.RetryAfter.Date - [datetimeoffset]::UtcNow).TotalSeconds
+            }
+        }
+        [pscustomobject]@{
+            Status = [int]$response.StatusCode
+            RetryAfter = [math]::Min(10, [math]::Max(0, $retryAfter))
+            Body = $text
+        }
+    }
+    finally {
+        if ($response) { $response.Dispose() }
+        $cancellation.Cancel()
+        $cancellation.Dispose()
+        $request.Dispose()
+        $client.Dispose()
+    }
+}
+
+function Send-ScanSnapshot {
+    param($d, [string]$Endpoint)
+    $id = [guid]::NewGuid().ToString('D')
+    $envelope = [pscustomobject]@{
+        TransportVersion = 1
+        SubmissionId = $id
+        SubmittedAtUtc = [datetime]::UtcNow.ToString('o')
+        Snapshot = New-ScanSnapshot $d
+    }
+    $body = [System.Text.Encoding]::UTF8.GetBytes(($envelope | ConvertTo-Json -Depth 14 -Compress))
+    if ($body.Length -gt 16777216) { throw 'Upload exceeds the 16 MiB request limit; snapshot was not sent.' }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $retry = $false
+        $delay = [math]::Pow(2, $attempt - 1)
+        $failure = 'Upload transport failed.'
+        try {
+            $response = Invoke-ScanUploadRequest -Endpoint $Endpoint -Body $body
+            $status = [int]$response.Status
+            if ($status -eq 200 -or $status -eq 201) {
+                $ack = $null
+                try { $ack = $response.Body | ConvertFrom-Json }
+                catch { throw 'API returned an invalid acknowledgement.' }
+                $expected = if ($status -eq 201) { 'created' } else { 'duplicate' }
+                if (-not $ack -or $ack.submissionId -ne $id -or $ack.status -ne $expected) {
+                    throw 'API returned an invalid acknowledgement.'
+                }
+                return
+            }
+            $failure = "Upload failed (HTTP $status)."
+            $retry = $status -in @(408, 429, 500, 502, 503, 504)
+            $delay = [math]::Min(10, [math]::Max($delay, $response.RetryAfter))
+        }
+        catch {
+            # PowerShell can wrap .NET task exceptions in MethodInvocationException.
+            $exception = $_.Exception
+            while ($exception) {
+                if ($exception -is [System.Threading.Tasks.TaskCanceledException] -or
+                    $exception -is [System.TimeoutException] -or
+                    $exception -is [System.IO.IOException] -or
+                    $exception -is [System.Net.Sockets.SocketException] -or
+                    ($exception -is [System.Net.WebException] -and
+                     $exception.Status -in @('Timeout', 'ConnectFailure', 'ConnectionClosed', 'NameResolutionFailure', 'ReceiveFailure', 'SendFailure'))) {
+                    $retry = $true
+                }
+                if ($exception -is [System.Security.Authentication.AuthenticationException]) {
+                    $retry = $false
+                    break
+                }
+                $exception = $exception.InnerException
+            }
+        }
+        if (-not $retry -or $attempt -eq 3) { throw $failure }
+        Start-Sleep -Seconds $delay
+    }
+}
+
+function Get-QuietExitCode {
+    param([object[]]$Summary)
+    if (@($Summary | Where-Object { $_.Status -ne 'OK' }).Count) { return 3 }
+    if (@($Summary | Where-Object { $_.UploadStatus -eq 'FAILED' }).Count) { return 4 }
+    if (@($Summary | Where-Object { $_.Critical -gt 0 -or $_.Regressions -gt 0 }).Count) { return 2 }
+    if (@($Summary | Where-Object { $_.Warning -gt 0 }).Count) { return 1 }
+    0
+}
+
 function Invoke-QuietScan {
     param(
         [string[]]$Targets, [int]$Days,
         [System.Management.Automation.PSCredential]$Cred,
-        [int]$Throttle, [string]$OutDir, [string]$Baseline, [switch]$NoHtml
+        [int]$Throttle, [string]$OutDir, [string]$Baseline, [switch]$NoHtml,
+        [string]$Endpoint
     )
 
     $sync = [hashtable]::Synchronized(@{
@@ -4824,6 +4977,7 @@ function Invoke-QuietScan {
             $summary.Add([pscustomobject]@{
                 Host = $t; Status = 'FAILED'; Critical = 0; Warning = 0; Info = 0
                 Regressions = 0; HtmlPath = ''; JsonPath = ''; Error = $errText
+                UploadStatus = 'NOT_SENT'; UploadError = ''
             })
             Write-Warning "$t : $($sync.Errors[$t])"
             continue
@@ -4859,6 +5013,19 @@ function Invoke-QuietScan {
             }
         }
 
+        $uploadStatus = 'DISABLED'; $uploadError = ''
+        if ($Endpoint) {
+            try {
+                Send-ScanSnapshot -d $d -Endpoint $Endpoint
+                $uploadStatus = 'OK'
+            }
+            catch {
+                $uploadStatus = 'FAILED'
+                $uploadError = 'Snapshot upload failed; check API availability, authorization, TLS, and request limits.'
+                Write-Warning "$name : $uploadError"
+            }
+        }
+
         $summary.Add([pscustomobject]@{
             Host        = $name
             Status      = 'OK'
@@ -4869,6 +5036,8 @@ function Invoke-QuietScan {
             HtmlPath    = $htmlPath
             JsonPath    = $jsonPath
             Error       = ''
+            UploadStatus = $uploadStatus
+            UploadError = $uploadError
         })
     }
 
@@ -4915,6 +5084,7 @@ function Invoke-QuietScan {
 #     2  at least one Critical finding, or a regression against the baseline
 #     3  at least one target could not be scanned (incomplete data - worst case
 #        for a monitoring job, so it outranks the finding severities)
+#     4  at least one requested upload failed (scan failure 3 takes precedence)
 # ---------------------------------------------------------------------------
 if ($Quiet) {
     $qTargets = @(Split-TargetList (($startupTargets -join ',')))
@@ -4928,7 +5098,7 @@ if ($Quiet) {
 
     $qSummary = @(Invoke-QuietScan -Targets $qTargets -Days $LookbackDays -Cred $qCred `
                                    -Throttle $script:ScanThrottle -OutDir $OutputPath `
-                                   -Baseline $BaselinePath -NoHtml:$NoHtml)
+                                   -Baseline $BaselinePath -NoHtml:$NoHtml -Endpoint $ApiEndpoint)
 
     if ($OutputPath) {
         try {
@@ -4952,10 +5122,7 @@ if ($Quiet) {
     # Emit the summary objects so the caller can pipe them.
     $qSummary
 
-    $code = 0
-    if ($warn -gt 0) { $code = 1 }
-    if ($crit -gt 0 -or $regs -gt 0) { $code = 2 }
-    if ($failed -gt 0) { $code = 3 }
+    $code = Get-QuietExitCode -Summary $qSummary
     exit $code
 }
 

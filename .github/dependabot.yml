@@ -1,7 +1,7 @@
 version: 2
 
 updates:
-  # This project has no runtime package dependencies - it is a single
+  # The collector has no runtime package dependencies - it is a single
   # PowerShell script that uses only in-box Windows cmdlets, deliberately, so
   # it can run on a locked-down or air-gapped host with nothing to install.
   #
@@ -52,3 +52,14 @@ updates:
     labels:
       - "dependencies"
       - "tests"
+
+  # Only the optional server component has .NET runtime dependencies.
+  - package-ecosystem: "nuget"
+    directories:
+      - "/api/SecurityHealth.Api"
+      - "/api/SecurityHealth.Api.Tests"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"

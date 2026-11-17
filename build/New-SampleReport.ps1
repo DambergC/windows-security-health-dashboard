@@ -30,7 +30,7 @@ Import-Module (Join-Path $PSScriptRoot '../tests/TestHelpers.psm1') -Force
 . ([scriptblock]::Create((Import-DashboardFunction `
     -FunctionName 'Format-Value', 'New-NVRows', 'Get-Section', 'Get-ArrSection', 'New-Findings',
                   'Get-UnifiedEvents', 'New-HealthCards', 'ConvertTo-ReportRows', 'New-ReportPanel',
-                  'Get-HtmlReport', 'ConvertTo-ScanSnapshot', 'Save-ScanSnapshot', 'Import-ScanSnapshot',
+                  'Get-HtmlReport', 'ConvertTo-ScanSnapshot', 'New-ScanSnapshot', 'Save-ScanSnapshot', 'Import-ScanSnapshot',
                   'Get-SnapshotRowKey', 'Test-IsRegression', 'Compare-ScanSnapshots',
                   'New-FleetRow', 'Add-FleetDeviation' `
     -VariableAssignment '$script:ReportTemplate', '$script:ModeMaps', '$script:EventSections',

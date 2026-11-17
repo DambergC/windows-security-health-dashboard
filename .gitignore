@@ -25,3 +25,8 @@ Thumbs.db
 # tests/browser/package-lock.json IS committed, so CI can npm ci and Dependabot
 # has something to bump.
 node_modules/
+
+# .NET API
+**/bin/
+**/obj/
+**/TestResults/
