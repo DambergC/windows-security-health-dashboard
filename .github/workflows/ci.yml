@@ -15,6 +15,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  api:
+    name: API and SQL integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test against an isolated SQL Server
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MSSQL_SA_PASSWORD="$(openssl rand -base64 24)Aa1!"
+          echo "::add-mask::$MSSQL_SA_PASSWORD"
+          container=$(docker run --name "security-health-sql-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD -p 127.0.0.1::1433 \
+            -d mcr.microsoft.com/mssql/server:2022-latest)
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          ready=0
+          for i in $(seq 1 60); do
+            if docker logs "$container" 2>&1 | grep -q 'SQL Server is now ready for client connections'; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            docker logs "$container"
+            exit 1
+          fi
+          port=$(docker port "$container" 1433/tcp | cut -d: -f2)
+          # SQL login and trust override are confined to this loopback test instance.
+          export SECURITYHEALTH_TEST_SQL="Server=127.0.0.1,$port;User ID=sa;Password=$MSSQL_SA_PASSWORD;Encrypt=true;TrustServerCertificate=true"
+          dotnet test api/SecurityHealth.Api.Tests --configuration Release --nologo
+          dotnet publish api/SecurityHealth.Api --configuration Release --no-restore --output "$RUNNER_TEMP/api"
+
   static:
     name: Static checks
     runs-on: ubuntu-latest

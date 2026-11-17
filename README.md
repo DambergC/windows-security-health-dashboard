@@ -135,9 +135,36 @@ if ($LASTEXITCODE -ge 2) { "Escalate - critical findings or regressions" }
 | `1` | At least one Warning finding |
 | `2` | At least one Critical finding, or a regression against the baseline |
 | `3` | At least one target could not be scanned |
+| `4` | A requested API upload failed (scan failures still return `3`) |
 
 `3` outranks the severities deliberately: a monitoring job that silently lost a
 host is worse than one that found problems.
+
+### Optional: send scans to SQL Server through an API
+
+Deploy the separate [IIS ingestion API](api/README.md), then opt in during a
+headless scan:
+
+```powershell
+.\src\SecurityHealthDashboard.ps1 -Quiet -ComputerName PC-042 `
+    -OutputPath C:\SecReports -ApiEndpoint https://security-api.corp.example/api/v1/scans
+```
+
+The collector authenticates as the account running the script or scheduled task;
+target `-Credential` is never sent to the API. Only the API connects to SQL Server,
+using its own Windows service identity. SQL stores full snapshots and indexed
+host/history metadata. No changes are made to scanned machines.
+
+Uploads work without `-OutputPath` and with `-NoHtml`. When requested, local
+reports are written before uploading and retained on failure. Summary objects
+and CSV include `UploadStatus` (`DISABLED`, `NOT_SENT` for failed scans, `OK`, or
+`FAILED`) and a sanitized `UploadError`. Transient failures receive at most
+three 30-second attempts and two delays capped at 10 seconds: up to 110 seconds
+per successful host, in addition to collection time. Exit precedence is scan
+failure `3`, upload failure `4`, then findings `2`, `1`, `0`.
+
+There is no background queue or automatic replay after the process exits.
+Without `-ApiEndpoint`, operation remains offline and requires no API or database.
 
 ### Run it weekly
 
@@ -190,6 +217,7 @@ src/SecurityHealthDashboard.ps1   the tool - one self-contained script
 build/                            static checks, gallery rehearsal, sample report
 tests/                            Pester unit + contract tests
 tests/browser/                    Playwright tests for the HTML report
+api/                              optional IIS ingestion API, SQL schema and API tests
 docs/screenshots/                 images used above
 examples/                         a sample -TargetFile list
 .github/workflows/                CI, security, release

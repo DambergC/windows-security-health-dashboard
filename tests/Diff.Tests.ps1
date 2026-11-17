@@ -4,7 +4,7 @@ BeforeAll {
     Import-Module (Join-Path $PSScriptRoot 'TestHelpers.psm1') -Force
     . ([scriptblock]::Create((Import-DashboardFunction `
         -FunctionName 'Format-Value', 'Get-Section', 'Get-ArrSection', 'ConvertTo-ScanSnapshot',
-                      'Save-ScanSnapshot', 'Import-ScanSnapshot', 'Get-SnapshotRowKey',
+                      'New-ScanSnapshot', 'Save-ScanSnapshot', 'Import-ScanSnapshot', 'Get-SnapshotRowKey',
                       'Test-IsRegression', 'Compare-ScanSnapshots' `
         -VariableAssignment '$script:EventSections', '$script:SectionKeys',
                             '$script:RegressionRules', '$script:AdditionIsNotable',
